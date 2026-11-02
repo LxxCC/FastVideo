@@ -123,6 +123,31 @@ def main() -> None:
         default="A red fox trotting through a snowy pine forest at golden hour, cinematic",
     )
     parser.add_argument(
+        "--image",
+        type=Path,
+        default=None,
+        help="EXPERIMENTAL image-to-video: condition on this image as the first frame "
+        "(Wan2.2 TI2V first-frame pinning). The image is scaled to cover --width x --height "
+        "and center-cropped, so pick a --height/--width with the image's aspect ratio. "
+        "Not combinable with --refine / --fast-spatial.",
+    )
+    parser.add_argument(
+        "--keyframe",
+        action="append",
+        default=[],
+        metavar="PATH@POS",
+        help="EXPERIMENTAL multi-image video: pin an extra image at timeline position POS in [0, 1] "
+        "(0 = first frame, 1 = last frame). Repeatable, e.g. --image a.jpg --keyframe b.jpg@0.5 "
+        "--keyframe c.jpg@1. --image is the same as --keyframe PATH@0. Pinning is out of the model's "
+        "training distribution for POS > 0, so results vary.",
+    )
+    parser.add_argument(
+        "--image-vae-device",
+        choices=("auto", "cpu", "mps"),
+        default="auto",
+        help="Device for the one-off VAE encode of --image.",
+    )
+    parser.add_argument(
         "--output-path",
         type=Path,
         default=Path("video_samples/demo_5b/fox_5b_mlx.mp4"),
@@ -252,6 +277,26 @@ def main() -> None:
     # latent never leaves the grid it was denoised on and the mode is usable.
     if args.refine and args.fast_spatial:
         print("[wan22] --refine takes precedence over --fast-spatial")
+    # Pinned images: (path, position in [0, 1]); --image is position 0.
+    pinned_images: list[tuple[Path, float]] = []
+    if args.image is not None:
+        pinned_images.append((args.image, 0.0))
+    for spec in args.keyframe:
+        path_str, sep, pos_str = spec.rpartition("@")
+        if not sep:
+            parser.error(f"--keyframe expects PATH@POS (POS in [0, 1]), got {spec!r}")
+        try:
+            pos = float(pos_str)
+        except ValueError:
+            parser.error(f"--keyframe position must be a number in [0, 1], got {pos_str!r}")
+        if not 0.0 <= pos <= 1.0:
+            parser.error(f"--keyframe position must be in [0, 1], got {pos}")
+        pinned_images.append((Path(path_str), pos))
+    for path, _pos in pinned_images:
+        if not path.is_file():
+            parser.error(f"image not found: {path}")
+    if pinned_images and (args.refine or args.fast_spatial):
+        parser.error("--image / --keyframe are not supported together with --refine / --fast-spatial yet")
 
     args.mlx_checkpoint = resolve_mlx_checkpoint(args.mlx_checkpoint, args.text_encoder_root)
     if args.mlx_checkpoint is not None:
@@ -401,6 +446,40 @@ def main() -> None:
     dit_load_s = time.perf_counter() - t1
     print(f"[5B] DiT loaded in {dit_load_s:.1f}s", flush=True)
 
+    first_frame = None
+    keyframes: list[tuple[int, mx.array]] = []
+    pinned_summary: list[dict] = []
+    image_encode_s = 0.0
+    if pinned_images:
+        from fastvideo.mlx_runtime.wan22_i2v import encode_keyframe_latents
+
+        # timeline position -> latent frame index; the first latent frame is the "first frame"
+        plan = []
+        seen: set[int] = set()
+        for path, pos in pinned_images:
+            idx = int(round(pos * (lat_t - 1)))
+            if idx in seen:
+                raise SystemExit(f"two images map to latent frame {idx} (of {lat_t}); move one of them "
+                                 f"or use fewer frames")
+            seen.add(idx)
+            plan.append((path, pos, idx))
+        t_img = time.perf_counter()
+        encoded = encode_keyframe_latents(
+            [(path, idx == 0) for path, _pos, idx in plan], args.vae_root,
+            height=lat_h * 16, width=lat_w * 16, device=args.image_vae_device,
+        )
+        image_encode_s = time.perf_counter() - t_img
+        for (path, pos, idx), (z_np, fit_info) in zip(plan, encoded, strict=True):
+            if z_np.shape != (1, in_ch, 1, lat_h, lat_w):
+                raise SystemExit(f"image latent {z_np.shape} != expected {(1, in_ch, 1, lat_h, lat_w)}")
+            if idx == 0:
+                first_frame = mx.array(z_np)
+            else:
+                keyframes.append((idx, mx.array(z_np)))
+            pinned_summary.append({"image": str(path.resolve()), "position": pos, "latent_frame": idx})
+            print(f"[5B i2v] {path.name} @ {pos:g} -> latent frame {idx}/{lat_t - 1}: {fit_info}", flush=True)
+        print(f"[5B i2v] encoded {len(plan)} image(s) in {image_encode_s:.1f}s", flush=True)
+
     freqs = make_rotary_embeddings(config, latent_frames=lat_t, latent_height=lat_h, latent_width=lat_w)
     gen = torch.Generator().manual_seed(args.seed)
     noise = mx.array(
@@ -418,6 +497,8 @@ def main() -> None:
         flow_shift=args.flow_shift,
         warp_denoising_step=not args.no_warp,
         seed=args.renoise_seed,
+        first_frame=first_frame,
+        keyframes=keyframes or None,
     )
     if spatial_mode == "refine":
         schedule, warped_steps = build_wan22_dmd_schedule(
@@ -492,6 +573,9 @@ def main() -> None:
         "output_path": str(args.output_path.resolve()),
         "prompt": args.prompt,
         "prompt_used": prompt_for_encode,
+        "image": str(args.image.resolve()) if args.image is not None else None,
+        "pinned_images": pinned_summary,
+        "image_encode_s": round(image_encode_s, 3),
         "enhance_prompt": args.enhance_prompt,
         "enhance_backend": enhance_backend,
         "enhance_elapsed_s": round(enhance_elapsed_s, 3),
